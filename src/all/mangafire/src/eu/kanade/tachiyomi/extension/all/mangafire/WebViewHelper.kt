@@ -32,6 +32,10 @@ class WebViewHelper(
     private val name = "MangaFire"
     private val mutex = Mutex()
 
+    // Переиспользуемый WebView
+    private var cachedWebView: WebView? = null
+    private var isWebViewLoading = false
+
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun loadInWebView(
         url: String,
@@ -39,7 +43,8 @@ class WebViewHelper(
         onPageFinish: (view: WebView) -> Unit = {},
     ): String = mutex.withLock {
         withContext(Dispatchers.Main.immediate) {
-            withTimeout(20.seconds) {
+            withTimeout(45.seconds) {
+                // Увеличил таймаут для первого вызова
                 suspendCancellableCoroutine { continuation ->
                     val emptyWebViewResponse = runCatching {
                         WebResourceResponse("text/html", "utf-8", Buffer().inputStream())
@@ -49,116 +54,126 @@ class WebViewHelper(
                     }
 
                     val context = Injekt.get<Application>()
-                    var webview: WebView? = WebView(context)
 
-                    fun cleanup() = runBlocking(Dispatchers.Main.immediate) {
-                        webview?.stopLoading()
-                        webview?.destroy()
-                        webview = null
+                    // Создаем WebView только при первом вызове
+                    if (cachedWebView == null) {
+                        cachedWebView = WebView(context).apply {
+                            settings.apply {
+                                javaScriptEnabled = true
+                                domStorageEnabled = true
+                                blockNetworkImage = true
+                            }
+                        }
                     }
 
-                    webview?.apply {
-                        with(settings) {
-                            javaScriptEnabled = true
-                            domStorageEnabled = true
-                            blockNetworkImage = true
-                        }
+                    val webview = cachedWebView!!
 
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldInterceptRequest(
-                                view: WebView,
-                                request: WebResourceRequest,
-                            ): WebResourceResponse? {
-                                // allow main page
-                                if (request.url.toString() == url) {
-                                    Log.d(name, "allowed: ${request.url}")
+                    // Останавливаем предыдущую загрузку, если она идет
+                    if (isWebViewLoading) {
+                        webview.stopLoading()
+                    }
 
-                                    runCatching { fetchWebResource(request) }
-                                        .onSuccess { return it }
-                                        .onFailure {
-                                            if (continuation.isActive) {
-                                                continuation.resumeWithException(it)
-                                                cleanup()
-                                            }
-                                        }
-                                }
+                    // Функция очистки без уничтожения WebView
+                    fun cleanup() {
+                        isWebViewLoading = false
+                    }
 
-                                // allow script from their cdn
-                                if (
-                                    request.url.host.orEmpty().contains("mfcdn.nl") &&
-                                    request.url.pathSegments.lastOrNull().orEmpty().contains("js")
-                                ) {
-                                    Log.d(name, "allowed: ${request.url}")
+                    webview.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(
+                            view: WebView,
+                            request: WebResourceRequest,
+                        ): WebResourceResponse? {
+                            // allow main page
+                            if (request.url.toString() == url) {
+                                Log.d(name, "allowed: ${request.url}")
 
-                                    runCatching { fetchWebResource(request) }
-                                        .onSuccess { return it }
-                                        .onFailure {
-                                            if (continuation.isActive) {
-                                                continuation.resumeWithException(it)
-                                                cleanup()
-                                            }
-                                        }
-                                }
-
-                                // allow jquery script
-                                if (
-                                    request.url.host.orEmpty().contains("cloudflare.com") &&
-                                    request.url.encodedPath.orEmpty().contains("jquery")
-                                ) {
-                                    Log.d(name, "allowed: ${request.url}")
-
-                                    runCatching { fetchWebResource(request) }
-                                        .onSuccess { return it }
-                                        .onFailure {
-                                            if (continuation.isActive) {
-                                                continuation.resumeWithException(it)
-                                                cleanup()
-                                            }
-                                        }
-                                }
-
-                                when (requestIntercept(request)) {
-                                    RequestIntercept.Allow -> {
-                                        Log.d(name, "allowed: ${request.url}")
-                                        runCatching { fetchWebResource(request) }
-                                            .onSuccess { return it }
-                                            .onFailure {
-                                                if (continuation.isActive) {
-                                                    continuation.resumeWithException(it)
-                                                    cleanup()
-                                                }
-                                            }
-                                    }
-
-                                    RequestIntercept.Block -> {
-                                        Log.d(name, "denied: ${request.url}")
-                                        return emptyWebViewResponse
-                                    }
-
-                                    RequestIntercept.Capture -> {
-                                        Log.d(name, "captured: ${request.url}")
+                                runCatching { fetchWebResource(request) }
+                                    .onSuccess { return it }
+                                    .onFailure {
                                         if (continuation.isActive) {
-                                            continuation.resume(request.url.toString())
+                                            continuation.resumeWithException(it)
                                             cleanup()
                                         }
-                                        return emptyWebViewResponse
                                     }
+                            }
+
+                            // allow script from their cdn
+                            if (
+                                request.url.host.orEmpty().contains("mfcdn.nl") &&
+                                request.url.pathSegments.lastOrNull().orEmpty().contains("js")
+                            ) {
+                                Log.d(name, "allowed: ${request.url}")
+
+                                runCatching { fetchWebResource(request) }
+                                    .onSuccess { return it }
+                                    .onFailure {
+                                        if (continuation.isActive) {
+                                            continuation.resumeWithException(it)
+                                            cleanup()
+                                        }
+                                    }
+                            }
+
+                            // allow jquery script
+                            if (
+                                request.url.host.orEmpty().contains("cloudflare.com") &&
+                                request.url.encodedPath.orEmpty().contains("jquery")
+                            ) {
+                                Log.d(name, "allowed: ${request.url}")
+
+                                runCatching { fetchWebResource(request) }
+                                    .onSuccess { return it }
+                                    .onFailure {
+                                        if (continuation.isActive) {
+                                            continuation.resumeWithException(it)
+                                            cleanup()
+                                        }
+                                    }
+                            }
+
+                            when (requestIntercept(request)) {
+                                RequestIntercept.Allow -> {
+                                    Log.d(name, "allowed: ${request.url}")
+                                    runCatching { fetchWebResource(request) }
+                                        .onSuccess { return it }
+                                        .onFailure {
+                                            if (continuation.isActive) {
+                                                continuation.resumeWithException(it)
+                                                cleanup()
+                                            }
+                                        }
                                 }
 
-                                return emptyWebViewResponse
+                                RequestIntercept.Block -> {
+                                    Log.d(name, "denied: ${request.url}")
+                                    return emptyWebViewResponse
+                                }
+
+                                RequestIntercept.Capture -> {
+                                    Log.d(name, "captured: ${request.url}")
+                                    if (continuation.isActive) {
+                                        continuation.resume(request.url.toString())
+                                        cleanup()
+                                    }
+                                    return emptyWebViewResponse
+                                }
                             }
 
-                            override fun onPageFinished(view: WebView, url: String) {
-                                super.onPageFinished(view, url)
-                                onPageFinish(view)
-                            }
+                            return emptyWebViewResponse
                         }
 
-                        loadUrl(url)
+                        override fun onPageFinished(view: WebView, url: String) {
+                            super.onPageFinished(view, url)
+                            isWebViewLoading = false
+                            onPageFinish(view)
+                        }
                     }
+                    isWebViewLoading = true
+                    webview.loadUrl(url)
 
                     continuation.invokeOnCancellation {
                         cleanup()
+                        webview.stopLoading()
                     }
                 }
             }
@@ -194,5 +209,12 @@ class WebViewHelper(
                 ).inputStream(),
             )
         }
+    }
+
+    fun destroy() {
+        cachedWebView?.stopLoading()
+        cachedWebView?.destroy()
+        cachedWebView = null
+        isWebViewLoading = false
     }
 }
